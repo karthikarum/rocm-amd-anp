@@ -1143,6 +1143,7 @@ struct ncclIbConnectionMetadata {
   int tc;
   int sl;
   uint32_t shareGroupId; // v3: non-zero if this QP belongs to a sharing group
+  uint32_t senderListenId; // sender's PID — disambiguates shareGroupId hash collisions
   uint16_t commId;       // sender's/receiver's commId for imm_data routing
   uint8_t  sharedGroupIdx; // N:m group index (0..m-1)
 };
@@ -1170,6 +1171,7 @@ struct ncclIbCommStage {
 struct ncclIbHandle {
   union ncclSocketAddress connectAddr; // Filled by the target
   uint64_t magic; // random number to help debugging
+  uint32_t peerListenId; // PID of the listening process — scopes QP sharing per remote rank
   struct ncclIbCommStage stage; // Used by the other side when connecting
 };
 
@@ -1179,8 +1181,8 @@ struct ncclIbHandle {
 
 struct anpSharedQpKey {
   int             ibDevN;
-  union ibv_gid   remoteGid;
-  union ncclSocketAddress connectAddr;
+  union ncclSocketAddress peerAddr;  // remote IP, port stripped
+  uint32_t        peerListenId;     // remote rank's PID
   bool            isSend;
   int             groupIdx;
 };
@@ -1221,8 +1223,8 @@ static bool anpSharedQpKeyMatch(const struct anpSharedQpKey* a,
   if (a->ibDevN != b->ibDevN) return false;
   if (a->isSend != b->isSend) return false;
   if (a->groupIdx != b->groupIdx) return false;
-  if (memcmp(&a->remoteGid, &b->remoteGid, sizeof(union ibv_gid)) != 0) return false;
-  if (memcmp(&a->connectAddr, &b->connectAddr, sizeof(union ncclSocketAddress)) != 0)
+  if (a->peerListenId != b->peerListenId) return false;
+  if (memcmp(&a->peerAddr, &b->peerAddr, sizeof(union ncclSocketAddress)) != 0)
     return false;
   return true;
 }
@@ -1254,18 +1256,6 @@ static struct anpSharedQp* anpFindSharedQp(const struct anpSharedQpKey* key) {
   return NULL;
 }
 
-static struct anpSharedQp* anpFindSharedQpByShareGroup(int ibDevN, uint32_t shareGroupId, bool isSend) {
-  for (int i = 0; i < ANP_MAX_SHARED_QPS; i++) {
-    if (g_sharedQpPool[i].inUse &&
-        g_sharedQpPool[i].key.ibDevN == ibDevN &&
-        g_sharedQpPool[i].shareGroupId == shareGroupId &&
-        g_sharedQpPool[i].key.isSend == isSend) {
-      return &g_sharedQpPool[i];
-    }
-  }
-  return NULL;
-}
-
 static struct anpSharedQp* anpFindSharedQpByQpn(uint32_t qpn) {
   for (int i = 0; i < ANP_MAX_SHARED_QPS; i++) {
     if (g_sharedQpPool[i].inUse && g_sharedQpPool[i].qp &&
@@ -1277,14 +1267,16 @@ static struct anpSharedQp* anpFindSharedQpByQpn(uint32_t qpn) {
 }
 
 static int anpCountPeerTotalRefcount(int ibDevN,
-                                     const union ncclSocketAddress* connectAddr,
-                                     bool isSend) {
+                                     const union ncclSocketAddress* peerAddr,
+                                     bool isSend,
+                                     uint32_t peerListenId) {
   int total = 0;
   for (int i = 0; i < ANP_MAX_SHARED_QPS; i++) {
     if (g_sharedQpPool[i].inUse &&
         g_sharedQpPool[i].key.ibDevN == ibDevN &&
         g_sharedQpPool[i].key.isSend == isSend &&
-        memcmp(&g_sharedQpPool[i].key.connectAddr, connectAddr,
+        g_sharedQpPool[i].key.peerListenId == peerListenId &&
+        memcmp(&g_sharedQpPool[i].key.peerAddr, peerAddr,
                sizeof(union ncclSocketAddress)) == 0) {
       total += g_sharedQpPool[i].refcount;
     }
@@ -1582,7 +1574,7 @@ ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base
     }
     cqDepth *= effectiveDepth;
     if (ibDev->maxCqe > 0 && cqDepth > ibDev->maxCqe) {
-      INFO(NCCL_NET, "NET/ANP: Shared CQ depth %d exceeds device max %d, clamping", cqDepth, ibDev->maxCqe);
+      WARN("NET/ANP: Shared CQ depth %d exceeds device max %d, clamping", cqDepth, ibDev->maxCqe);
       cqDepth = ibDev->maxCqe;
     }
   }
@@ -1817,6 +1809,7 @@ ncclResult_t anpNetListen(int dev, void* opaqueHandle, void** listenComm) {
   NCCLCHECKGOTO(ncclSocketInit(&comm->sock, &ncclIbIfAddr, handle->magic, ncclSocketTypeNetIb, NULL, 1), ret, fail);
   NCCLCHECKGOTO(ncclSocketListen(&comm->sock), ret, fail);
   NCCLCHECKGOTO(ncclSocketGetAddr(&comm->sock, &handle->connectAddr), ret, fail);
+  handle->peerListenId = (uint32_t)getpid();
   *listenComm = comm;
 exit:
   return ret;
@@ -1919,24 +1912,39 @@ ib_recv_dev_list:
     struct anpSharedQpKey lookupKey;
     memset(&lookupKey, 0, sizeof(lookupKey));
     lookupKey.ibDevN = comm->base.vProps.devs[0];
-    memcpy(&lookupKey.connectAddr, &handle->connectAddr, sizeof(union ncclSocketAddress));
-    anpStripPort(&lookupKey.connectAddr);
+    memcpy(&lookupKey.peerAddr, &handle->connectAddr, sizeof(union ncclSocketAddress));
+    anpStripPort(&lookupKey.peerAddr);
+    lookupKey.peerListenId = handle->peerListenId;
     lookupKey.isSend = true;
 
     int m = ncclParamAnpQpSharingGroups();
     if (m < 1) m = 1;
     int channelSeq = anpCountPeerTotalRefcount(
-        lookupKey.ibDevN, &lookupKey.connectAddr, true);
+        lookupKey.ibDevN, &lookupKey.peerAddr, true, lookupKey.peerListenId);
     sharedGroupIdx = channelSeq % m;
     lookupKey.groupIdx = sharedGroupIdx;
 
+    {
+      char addrStr[SOCKET_NAME_MAXLEN] = "";
+      ncclSocketToString(&lookupKey.peerAddr, addrStr, 1);
+      INFO(NCCL_NET, "NET/ANP: connect ch %d lookup key: ibDevN=%d isSend=%d groupIdx=%d "
+           "peerAddr=%s peerListenId=%u",
+           channelId, lookupKey.ibDevN, lookupKey.isSend, lookupKey.groupIdx,
+           addrStr, lookupKey.peerListenId);
+    }
+
     sharedEntry = anpFindSharedQp(&lookupKey);
-    if (sharedEntry) {
-      INFO(NCCL_NET, "NET/ANP: ch %d found existing shared send QP group=%d qpn=%u ibDevN=%d refcount=%d",
-           channelId, sharedGroupIdx, sharedEntry->qp->qp_num, sharedEntry->ownerIbDevN, sharedEntry->refcount);
-    } else {
-      INFO(NCCL_NET, "NET/ANP: ch %d will create new shared send QP group=%d (channelSeq=%d, m=%d)",
-           channelId, sharedGroupIdx, channelSeq, m);
+    {
+      char connAddrStr[SOCKET_NAME_MAXLEN] = "";
+      ncclSocketToString(&handle->connectAddr, connAddrStr, 1);
+      WARN("NET/ANP/QPS: connect ch %d lookup: ibDevN=%d localDev=%s peerAddr=%s "
+           "peerListenId=%u groupIdx=%d channelSeq=%d m=%d -> %s qpn=%u refcount=%d",
+           channelId, lookupKey.ibDevN, ncclIbDevs[lookupKey.ibDevN].devName,
+           connAddrStr, lookupKey.peerListenId,
+           sharedGroupIdx, channelSeq, m,
+           sharedEntry ? "REUSE" : "NEW",
+           sharedEntry ? sharedEntry->qp->qp_num : 0,
+           sharedEntry ? sharedEntry->refcount : 0);
     }
   }
   comm->base.sharedGroupIdx = sharedGroupIdx;
@@ -2013,8 +2021,9 @@ ib_recv_dev_list:
       struct anpSharedQpKey regKey;
       memset(&regKey, 0, sizeof(regKey));
       regKey.ibDevN = comm->base.vProps.devs[0];
-      memcpy(&regKey.connectAddr, &handle->connectAddr, sizeof(union ncclSocketAddress));
-      anpStripPort(&regKey.connectAddr);
+      memcpy(&regKey.peerAddr, &handle->connectAddr, sizeof(union ncclSocketAddress));
+      anpStripPort(&regKey.peerAddr);
+      regKey.peerListenId = handle->peerListenId;
       regKey.isSend = true;
       regKey.groupIdx = sharedGroupIdx;
       int ownerDevIdx = comm->base.qps[0].devIndex;
@@ -2032,8 +2041,11 @@ ib_recv_dev_list:
         comm->base.isSharedOwner = true;
         comm->base.pollCq = newEntry->ownerCq;
         comm->base.pollDevBase = newEntry->ownerDevBase;
-        INFO(NCCL_NET, "NET/ANP: ch %d registered shared QP %d group=%d (shareGroup=0x%x)",
-             channelId, comm->base.qps[0].qp->qp_num, sharedGroupIdx, meta.shareGroupId);
+        WARN("NET/ANP/QPS: connect ch %d REGISTERED: ibDevN=%d localDev=%s qpn=%u "
+             "shareGroupId=0x%x devIndex=%d remDevIdx=%d peerListenId=%u",
+             channelId, regKey.ibDevN, ncclIbDevs[regKey.ibDevN].devName,
+             newEntry->qp->qp_num, newEntry->shareGroupId,
+             newEntry->devIndex, newEntry->remDevIdx, regKey.peerListenId);
       }
     }
   } // end if(sharedEntry) else
@@ -2093,9 +2105,20 @@ ib_recv_dev_list:
   }
   meta.fifoAddr = (uint64_t)comm->fifo;
   meta.commId = comm->base.commId;
+  meta.senderListenId = (uint32_t)getpid();
   meta.sl = (ncclParamIbSl() != 0) ? ncclParamIbSl() : (config && config->trafficClass != NCCL_NET_TRAFFIC_CLASS_UNDEF) ? config->trafficClass : NCCL_IB_SL_DEFAULT;
   meta.tc = (ncclParamIbTc() != 0) ? ncclParamIbTc() : (config && config->trafficClass != NCCL_NET_TRAFFIC_CLASS_UNDEF) ? config->trafficClass : NCCL_IB_TC_DEFAULT;
   strncpy(meta.devName, mergedDev->devName, MAX_MERGED_DEV_NAME);
+
+  {
+    char connAddrStr[SOCKET_NAME_MAXLEN] = "";
+    ncclSocketToString(&handle->connectAddr, connAddrStr, 1);
+    WARN("NET/ANP/QPS: connect ch %d SEND meta: commId=%u shareGroupId=0x%x "
+         "groupIdx=%u qpn=%u localDev=%s peerAddr=%s sharedQp=%d isOwner=%d",
+         channelId, meta.commId, meta.shareGroupId, meta.sharedGroupIdx,
+         meta.qpInfo[0].qpn, mergedDev->devName, connAddrStr,
+         comm->base.sharedQp, comm->base.isSharedOwner);
+  }
 
   stage->state = ncclIbCommStateSend;
   stage->offset = 0;
@@ -2334,6 +2357,15 @@ ib_recv:
   /* copy back the received info */
   memcpy(&remMeta, stage->buffer, sizeof(struct ncclIbConnectionMetadata));
 
+  {
+    char peerStr[SOCKET_NAME_MAXLEN] = "";
+    ncclSocketToString(&rComm->base.sock.addr, peerStr, 1);
+    WARN("NET/ANP/QPS: accept ch %d RECV meta: senderCommId=%u shareGroupId=0x%x "
+         "groupIdx=%u senderQpn=%u senderDev=%s senderPid=%u peerAddr=%s",
+         channelId, remMeta.commId, remMeta.shareGroupId, remMeta.sharedGroupIdx,
+         remMeta.qpInfo[0].qpn, remMeta.devName, remMeta.senderListenId, peerStr);
+  }
+
   // IB setup
   // Pre-declare variables because of goto
   struct ncclIbDev* ibDev;
@@ -2359,13 +2391,29 @@ ib_recv:
 
   struct anpSharedQp* acceptSharedEntry;
   acceptSharedEntry = NULL;
+  struct anpSharedQpKey acceptLookupKey;
+  memset(&acceptLookupKey, 0, sizeof(acceptLookupKey));
   if (ncclParamAnpQpSharing() && remMeta.shareGroupId != 0 && rComm->base.vProps.ndevs > 0) {
-    acceptSharedEntry = anpFindSharedQpByShareGroup(
-        rComm->base.vProps.devs[0], remMeta.shareGroupId, false);
-    if (acceptSharedEntry) {
-      INFO(NCCL_NET, "NET/ANP: ch %d found existing shared recv QP group=%d qpn=%u ibDevN=%d shareGroup=0x%x refcount=%d",
-           channelId, remMeta.sharedGroupIdx, acceptSharedEntry->qp->qp_num, acceptSharedEntry->ownerIbDevN,
-           remMeta.shareGroupId, acceptSharedEntry->refcount);
+    acceptLookupKey.ibDevN = rComm->base.vProps.devs[0];
+    memcpy(&acceptLookupKey.peerAddr, &rComm->base.sock.addr, sizeof(union ncclSocketAddress));
+    anpStripPort(&acceptLookupKey.peerAddr);
+    acceptLookupKey.peerListenId = remMeta.senderListenId;
+    acceptLookupKey.isSend = false;
+    acceptLookupKey.groupIdx = remMeta.sharedGroupIdx;
+
+    acceptSharedEntry = anpFindSharedQp(&acceptLookupKey);
+    {
+      char addrStr[SOCKET_NAME_MAXLEN] = "";
+      ncclSocketToString(&rComm->base.sock.addr, addrStr, 1);
+      WARN("NET/ANP/QPS: accept ch %d lookup: ibDevN=%d localDev=%s peerAddr=%s "
+           "peerListenId=%u groupIdx=%d -> %s qpn=%u refcount=%d",
+           channelId, acceptLookupKey.ibDevN,
+           ncclIbDevs[acceptLookupKey.ibDevN].devName,
+           addrStr, acceptLookupKey.peerListenId,
+           acceptLookupKey.groupIdx,
+           acceptSharedEntry ? "REUSE" : "NEW",
+           acceptSharedEntry ? acceptSharedEntry->qp->qp_num : 0,
+           acceptSharedEntry ? acceptSharedEntry->refcount : 0);
     }
   }
 
@@ -2478,13 +2526,8 @@ ib_recv:
     // Register owner QP in shared pool if sharing
     if (acceptIsSharedOwner && rComm->base.nqps > 0) {
       int ownerDevIdx = rComm->base.qps[0].devIndex;
-      struct anpSharedQpKey acceptKey;
-      memset(&acceptKey, 0, sizeof(acceptKey));
-      acceptKey.ibDevN = rComm->base.vProps.devs[0];
-      acceptKey.isSend = false;
-      acceptKey.groupIdx = remMeta.sharedGroupIdx;
       struct anpSharedQp* newEntry = anpRegisterSharedQp(
-          &acceptKey, rComm->base.qps[0].qp, rComm->devs[ownerDevIdx].base.cq,
+          &acceptLookupKey, rComm->base.qps[0].qp, rComm->devs[ownerDevIdx].base.cq,
           &rComm->devs[ownerDevIdx].base, ownerDevIdx, rComm->base.qps[0].remDevIdx);
       if (newEntry) {
         newEntry->shareGroupId = remMeta.shareGroupId;
@@ -2498,8 +2541,10 @@ ib_recv:
         rComm->base.isSharedOwner = true;
         rComm->base.pollCq = newEntry->ownerCq;
         rComm->base.pollDevBase = newEntry->ownerDevBase;
-        INFO(NCCL_NET, "NET/ANP: accept ch %d registered shared QP %d group=%d (shareGroup=0x%x)",
-             channelId, rComm->base.qps[0].qp->qp_num, remMeta.sharedGroupIdx, remMeta.shareGroupId);
+        INFO(NCCL_NET, "NET/ANP: accept ch %d REGISTER shared recv QP qpn=%d group=%d shareGroup=0x%x "
+             "key: ibDevN=%d groupIdx=%d peerListenId=%u",
+             channelId, rComm->base.qps[0].qp->qp_num, remMeta.sharedGroupIdx, remMeta.shareGroupId,
+             acceptLookupKey.ibDevN, acceptLookupKey.groupIdx, acceptLookupKey.peerListenId);
       }
     }
   }
@@ -3256,8 +3301,6 @@ ncclResult_t anpNetIrecvDefault(void* recvComm, int n, void** data, size_t* size
     }
 #ifdef ANP_DEBUG_TRACE_EN
     INFO(NCCL_NET, "Posted RECV WQE, ch %d, qp %d, nic %d, dev index %d",
-         qp->channelId, qp->qp->qp_num, comm->devs[qp->devIndex].base.ibDevN, qp->devIndex);
-    WARN("Posted RECV WQE, ch %d, qp %d, nic %d, dev index %d",
          qp->channelId, qp->qp->qp_num, comm->devs[qp->devIndex].base.ibDevN, qp->devIndex);
 #endif
     ANP_TELEMETRY_EXECUTE(

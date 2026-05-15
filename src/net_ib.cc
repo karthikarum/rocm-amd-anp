@@ -1584,7 +1584,7 @@ static void ncclIbAddEvent(struct ncclIbRequest* req, int devIndex, struct ncclI
   req->events[devIndex]++;
   req->devBases[devIndex] = base;
 }
-ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base, void* cq_context) {
+ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base, void* cq_context, int depthMultiplier = 1) {
   base->ibDevN = ibDevN;
   ncclIbDev* ibDev = ncclIbDevs + ibDevN;
   pthread_mutex_lock(&ibDev->lock);
@@ -1602,7 +1602,7 @@ ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base
 
   // CQ is sized to accommodate the max SQ + RQ WQE completions. If each SQ WQE could be signaled, then,
   // for each QP, there can be 2*MAX_REQUESTS completions for SQ and MAX_REQUESTS completions for RQ.
-  NCCLCHECK(wrap_ibv_create_cq(&base->cq, ibDev->context, 3*MAX_REQUESTS*ncclParamIbQpsPerConn(), cq_context, NULL, 0));
+  NCCLCHECK(wrap_ibv_create_cq(&base->cq, ibDev->context, 3*MAX_REQUESTS*ncclParamIbQpsPerConn()*depthMultiplier, cq_context, NULL, 0));
 #ifdef ANP_DEBUG_TRACE_EN
   INFO(NCCL_NET, "[ANP_TRACE] Created cq, ibDevN %d, handle %u, fd %d, refcount %d, cqe %d", ibDevN, base->cq->handle,
        base->cq->channel ? base->cq->channel->fd : -1,
@@ -1626,13 +1626,6 @@ returning:
   return res;
 }
 
-// Create a CQ with scaled depth for shared QP primaries
-static ncclResult_t anpCreateScaledCq(int ibDevN, struct ibv_cq** cq, void* cq_context, int depthMultiplier) {
-    ncclIbDev* ibDev = ncclIbDevs + ibDevN;
-    int cqDepth = 3 * MAX_REQUESTS * ncclParamIbQpsPerConn() * depthMultiplier;
-    NCCLCHECK(wrap_ibv_create_cq(cq, ibDev->context, cqDepth, cq_context, NULL, 0));
-    return ncclSuccess;
-}
 
 // Print a one-shot sharing summary for a given peer direction.
 // Called on the first isend/irecv; the `printed` flag on slot-0 prevents repeats.
@@ -1900,10 +1893,12 @@ ib_recv_dev_list:
     g_anp_state.set_device_name(dev, "", mergedDev->devName);
   );
   // Init PD, Ctx for each IB device
+  int depthMult;
+  depthMult = (rcclParamAnpCommNGroups() > 0) ? std::max((int64_t)1, rcclParamAnpQpDepthMultiplier()) : 1;
   comm->ar = 1; // Set to 1 for logic
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     int ibDevN = comm->base.vProps.devs[i];
-    NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &comm->devs[i].base, &comm->base.stats), ret, fail);
+    NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &comm->devs[i].base, &comm->base.stats, depthMult), ret, fail);
     comm->ar = comm->ar && ncclIbDevs[ibDevN].ar; // ADAPTIVE_ROUTING - if all merged devs have it enabled
   }
 
@@ -2012,14 +2007,6 @@ ib_recv_dev_list:
   if (rcclParamAnpCommNGroups() > 0 && !isSharedSecondary) {
     // PRIMARY: create QPs with scaled depth
     comm->base.isSharedQpPrimary = true;
-    int depthMult = std::max((int64_t)1, rcclParamAnpQpDepthMultiplier());
-
-    // Recreate CQs with scaled depth for each device
-    for (int d = 0; d < comm->base.vProps.ndevs; d++) {
-      int ibDevN = comm->base.vProps.devs[d];
-      wrap_ibv_destroy_cq(comm->devs[d].base.cq);
-      NCCLCHECKGOTO(anpCreateScaledCq(ibDevN, &comm->devs[d].base.cq, &comm->base.stats, depthMult), ret, fail);
-    }
 
     int devIndex = 0;
     for (int q = 0; q < comm->base.nqps; q++) {
@@ -2413,10 +2400,12 @@ ib_recv:
   // Metadata to send back to requestor (sender)
   struct ncclIbConnectionMetadata meta;
   memset(&meta, 0, sizeof(meta));
+  int depthMult;
+  depthMult = (rcclParamAnpCommNGroups() > 0) ? std::max((int64_t)1, rcclParamAnpQpDepthMultiplier()) : 1;
   for (int i = 0; i < rComm->base.vProps.ndevs; i++) {
     rCommDev = rComm->devs + i;
     ibDevN = rComm->base.vProps.devs[i];
-    NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &rCommDev->base, &rComm->base.stats), ret, fail);
+    NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &rCommDev->base, &rComm->base.stats, depthMult), ret, fail);
     ibDev = ncclIbDevs + ibDevN;
     NCCLCHECKGOTO(ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &rCommDev->base.gidInfo.localGidIndex), ret, fail);
     NCCLCHECKGOTO(wrap_ibv_query_gid(ibDev->context, ibDev->portNum, rCommDev->base.gidInfo.localGidIndex, &rCommDev->base.gidInfo.localGid), ret, fail);
@@ -2533,14 +2522,6 @@ ib_recv:
   } else if (rcclParamAnpCommNGroups() > 0 && rComm->base.commId != 0) {
     // PRIMARY: create QPs with scaled depth
     rComm->base.isSharedQpPrimary = true;
-    int depthMult = std::max((int64_t)1, rcclParamAnpQpDepthMultiplier());
-
-    // Recreate CQs with scaled depth for each device
-    for (int d = 0; d < rComm->base.vProps.ndevs; d++) {
-      int devIbN = rComm->base.vProps.devs[d];
-      wrap_ibv_destroy_cq(rComm->devs[d].base.cq);
-      NCCLCHECKGOTO(anpCreateScaledCq(devIbN, &rComm->devs[d].base.cq, &rComm->base.stats, depthMult), ret, fail);
-    }
 
     devIndex = 0;
     for (int q = 0; q < rComm->base.nqps; q++) {
